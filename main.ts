@@ -714,8 +714,8 @@ function renderGemini(req: NRequest, model: string): Json {
     }
     for (const part of message.parts) {
       if (part.kind === 'text') parts.push({ text: part.text });
-      else if (part.kind === 'imageData') parts.push({ inline_data: { mime_type: part.media, data: part.data } });
-      else parts.push({ file_data: { file_uri: part.url } });
+      else if (part.kind === 'imageData') parts.push({ inlineData: { mimeType: part.media, data: part.data } });
+      else parts.push({ fileData: { fileUri: part.url } });
     }
     for (const call of message.toolCalls) {
       parts.push({ functionCall: { name: call.name, args: argsObject(call.argsJson) } });
@@ -1090,9 +1090,15 @@ function candidatesFor(needs: Requirement, req: NRequest, clientWire: ClientWire
     out.push({ provider, row, probeOk });
   }
   out.sort((a, b) => {
-    if (b.row.rating !== a.row.rating) return b.row.rating - a.row.rating;
     const fa = providerFailures.get(a.provider.id) ?? 0;
     const fb = providerFailures.get(b.provider.id) ?? 0;
+    // A provider that has refused twice is treated as spent (budget or outage) and sinks below
+    // every provider that has not, whatever its rating: the calls it would waste cost more than
+    // the few milli-points its models might add.
+    const deadA = fa >= 2 ? 1 : 0;
+    const deadB = fb >= 2 ? 1 : 0;
+    if (deadA !== deadB) return deadA - deadB;
+    if (b.row.rating !== a.row.rating) return b.row.rating - a.row.rating;
     if (fa !== fb) return fa - fb;
     if (a.probeOk !== b.probeOk) return a.probeOk ? -1 : 1;
     const wa = a.provider.wire === clientWire ? 0 : 1;
@@ -1122,7 +1128,12 @@ async function callProvider(candidate: Candidate, req: NRequest, rawBody: Json, 
     // Same wire as the client: the client's own body, with the chosen model named.
     body = clientWire === 'openai' ? { ...rawBody, model: row.model } : renderOpenAI(req, row.model);
     if (clientWire !== 'openai' || req.stream !== true) body.stream = false;
-    if (req.stream === true && clientWire === 'openai') headers.accept = 'text/event-stream';
+    if (req.stream === true && clientWire === 'openai') {
+      headers.accept = 'text/event-stream';
+      // A streamed answer must still carry its final usage: ask for it in the upstream call.
+      const options = isRecord(body.stream_options) ? body.stream_options : {};
+      body.stream_options = { ...options, include_usage: true };
+    }
   } else if (provider.wire === 'anthropic') {
     url = `${base}/v1/messages`;
     headers['anthropic-version'] = req.anthropicVersion;
@@ -1175,12 +1186,15 @@ async function serve(clientWire: ClientWire, rawBody: Json, version: string, res
       continue;
     }
     if (reply.status >= 200 && reply.status < 300) {
-      if (candidate.provider.wire === clientWire) {
-        // Same wire both sides: the provider's own document (or its event stream) passes through.
-        const type = req.stream ? 'text/event-stream' : reply.contentType;
-        sendText(res, 200, type, reply.text);
+      const upstreamSse = reply.contentType.includes('text/event-stream');
+      if (candidate.provider.wire === clientWire && req.stream === upstreamSse) {
+        // Same wire both sides and the same shape the client asked for: the provider's own
+        // document (or its event stream) passes through untouched.
+        sendText(res, 200, req.stream ? 'text/event-stream' : reply.contentType, reply.text);
         return;
       }
+      // Otherwise the answer is rebuilt in the client's wire from the parsed provider document:
+      // a cross-wire answer, or a JSON answer to a client that asked for a stream.
       let parsed: unknown;
       try {
         parsed = JSON.parse(reply.text);
